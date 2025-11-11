@@ -11,9 +11,10 @@ pipeline {
     TF_IN_AUTOMATION = '1'
     TF_INPUT         = '0'
     TF_PLUGIN_CACHE_DIR = '/var/lib/jenkins/.terraform.d/plugin-cache'
-    AWS_EC2_METADATA_DISABLED = 'true'
     TF_LOG      = 'INFO'
     TF_LOG_PATH = "${WORKSPACE}/terraform.init.log"
+    // Set your default region explicitly; Terraform errors if region mismatches:contentReference[oaicite:0]{index=0}
+    AWS_DEFAULT_REGION = "us-east-1"
   }
 
   stages {
@@ -26,15 +27,18 @@ pipeline {
       }
     }
 
+    // Preflight checks for network/API reachability
     stage('Preflight: network') {
       steps {
         sh '''
           set -e
           mkdir -p /var/lib/jenkins/.terraform.d/plugin-cache || true
+          echo "Checking registry..."
           curl -I --max-time 10 https://registry.terraform.io >/dev/null 2>&1 || { echo "Cannot reach registry.terraform.io"; exit 1; }
+          echo "Checking releases..."
           curl -I --max-time 10 https://releases.hashicorp.com >/dev/null 2>&1 || { echo "Cannot reach releases.hashicorp.com"; exit 1; }
+          echo "Checking GitHub objects..."
           curl -I --max-time 10 https://objects.githubusercontent.com >/dev/null 2>&1 || { echo "Cannot reach objects.githubusercontent.com"; exit 1; }
-          aws sts get-caller-identity || true
         '''
       }
     }
@@ -43,11 +47,12 @@ pipeline {
       steps { sh 'terraform --version' }
     }
 
+    // Run init with -upgrade to get the latest provider versions
     stage('Terraform init') {
       steps {
         retry(2) {
-          timeout(time: 8, unit: 'MINUTES') {
-            sh 'terraform init -input=false -no-color --reconfigure'
+          timeout(time: 10, unit: 'MINUTES') {
+            sh 'terraform init -input=false -no-color -upgrade --reconfigure'
           }
         }
       }
@@ -57,13 +62,22 @@ pipeline {
       steps { sh 'terraform validate -no-color' }
     }
 
+    // Pass AWS keys and optional session token into plan; print identity and region
     stage('Terraform plan') {
       steps {
         withCredentials([
-          string(credentialsId: 'aws-access-key', variable: 'AWS_ACCESS_KEY_ID'),
-          string(credentialsId: 'aws-secret-key', variable: 'AWS_SECRET_ACCESS_KEY')
+          string(credentialsId: 'aws-access-key',   variable: 'AWS_ACCESS_KEY_ID'),
+          string(credentialsId: 'aws-secret-key',   variable: 'AWS_SECRET_ACCESS_KEY'),
+          string(credentialsId: 'aws-session-token', variable: 'AWS_SESSION_TOKEN') // optional; remove if not needed
         ]) {
-          sh 'terraform plan -no-color -out=tfplan'
+          sh '''
+            echo "Using AWS region: $AWS_DEFAULT_REGION"
+            echo "Caller identity check:"
+            aws sts get-caller-identity || true
+
+            # Enable detailed logging for debugging:contentReference[oaicite:1]{index=1}
+            TF_LOG=DEBUG terraform plan -no-color -out=tfplan 2> plan.debug.log
+          '''
         }
       }
     }
@@ -72,8 +86,9 @@ pipeline {
       when { expression { return params.APPLY == true } }
       steps {
         withCredentials([
-          string(credentialsId: 'aws-access-key', variable: 'AWS_ACCESS_KEY_ID'),
-          string(credentialsId: 'aws-secret-key', variable: 'AWS_SECRET_ACCESS_KEY')
+          string(credentialsId: 'aws-access-key',   variable: 'AWS_ACCESS_KEY_ID'),
+          string(credentialsId: 'aws-secret-key',   variable: 'AWS_SECRET_ACCESS_KEY'),
+          string(credentialsId: 'aws-session-token', variable: 'AWS_SESSION_TOKEN') // optional
         ]) {
           sh 'terraform apply -no-color -auto-approve tfplan'
         }
@@ -83,7 +98,8 @@ pipeline {
 
   post {
     always {
-      archiveArtifacts artifacts: 'terraform.init.log', allowEmptyArchive: true
+      // Archive both init and plan debug logs for troubleshooting
+      archiveArtifacts artifacts: 'terraform.init.log, plan.debug.log', allowEmptyArchive: true
     }
   }
 }
