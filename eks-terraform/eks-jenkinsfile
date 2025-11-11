@@ -1,23 +1,30 @@
 pipeline {
-  agent any
+  agent { label 'built-in' }   // or 'master' if that’s your node’s label
+
   parameters {
-    choice(name: 'ACTION', choices: ['apply', 'destroy'], description: 'Terraform action')
+    choice(name: 'ACTION', choices: ['apply','destroy'], description: 'Select Terraform action')
   }
+
   stages {
-    stage('Checkout') {
+    stage('Checkout from Git') {
       steps {
-        git branch: 'main',
-            url: 'https://github.com/neyocloud/E-Commerce-Application-11-Services-on-AWS-EKS.git'
+        // For Pipeline from SCM, Jenkins already fetched the Jenkinsfile.
+        // If you need the whole repo in the workspace, do:
+        checkout scm
       }
     }
+
     stage('Terraform version') { steps { sh 'terraform --version' } }
+
     stage('Terraform init')      { steps { dir('eks-terraform') { sh 'terraform init --reconfigure' } } }
     stage('Terraform validate')  { steps { dir('eks-terraform') { sh 'terraform validate' } } }
     stage('Terraform plan')      { steps { dir('eks-terraform') { sh 'terraform plan' } } }
+
     stage('Terraform apply') {
       when { expression { params.ACTION == 'apply' } }
       steps { dir('eks-terraform') { sh 'terraform apply -auto-approve' } }
     }
+
     stage('Terraform destroy') {
       when { expression { params.ACTION == 'destroy' } }
       steps { dir('eks-terraform') { sh 'terraform destroy -auto-approve' } }
