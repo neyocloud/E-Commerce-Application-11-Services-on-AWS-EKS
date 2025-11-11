@@ -1,15 +1,35 @@
 pipeline {
   agent any
+
   options {
     durabilityHint('MAX_SURVIVABILITY')
     timestamps()
-    timeout(time: 60, unit: 'MINUTES')
+    timeout(time: 60, unit: 'MINUTES')     // guard the whole pipeline
   }
+
   environment {
+    // Terraform non-interactive
     TF_IN_AUTOMATION = '1'
-    TF_INPUT = '0'
+    TF_INPUT         = '0'
+
+    // Make init fast after first run
+    TF_PLUGIN_CACHE_DIR = '/var/lib/jenkins/.terraform.d/plugin-cache'
+
+    // Cut AWS metadata/IMDS delays if you are NOT using an instance profile
+    AWS_EC2_METADATA_DISABLED = 'true'
+
+    // Log where init is spending time
+    TF_LOG      = 'INFO'
+    TF_LOG_PATH = "${WORKSPACE}/terraform.init.log"
+
+    // ---- If you are behind a proxy, UNCOMMENT and set these ----
+    // HTTPS_PROXY = 'http://proxy.internal:3128'
+    // HTTP_PROXY  = 'http://proxy.internal:3128'
+    // NO_PROXY    = '169.254.169.254,localhost,127.0.0.1,.amazonaws.com'
   }
+
   stages {
+
     stage('Checkout from Git') {
       steps {
         checkout([$class: 'GitSCM',
@@ -18,28 +38,58 @@ pipeline {
         ])
       }
     }
-    stage('Terraform version') { steps { sh 'terraform --version' } }
+
+    stage('Preflight: network') {
+      steps {
+        sh '''
+          set -e
+          mkdir -p /var/lib/jenkins/.terraform.d/plugin-cache || true
+          echo "Checking registry..."
+          curl -I --max-time 10 https://registry.terraform.io >/dev/null 2>&1 || { echo "FAIL: registry.terraform.io"; exit 1; }
+          echo "Checking releases..."
+          curl -I --max-time 10 https://releases.hashicorp.com >/dev/null 2>&1 || { echo "FAIL: releases.hashicorp.com"; exit 1; }
+          echo "Checking GitHub objects..."
+          curl -I --max-time 10 https://objects.githubusercontent.com >/dev/null 2>&1 || { echo "FAIL: objects.githubusercontent.com"; exit 1; }
+          echo "AWS identity (ok if it fails when using static creds)..."
+          aws sts get-caller-identity || true
+        '''
+      }
+    }
+
+    stage('Terraform version') {
+      steps { sh 'terraform --version' }
+    }
+
     stage('Terraform init') {
       steps {
-        dir('eks-terraform') {
-          retry(2) {
-            timeout(time: 15, unit: 'MINUTES') {
-              sh 'terraform init -input=false -upgrade -no-color --reconfigure'
-            }
+        retry(2) {
+          timeout(time: 8, unit: 'MINUTES') {
+            sh '''
+              set -e
+              terraform init -input=false -no-color --reconfigure
+            '''
           }
         }
       }
     }
-    stage('Terraform validate') { steps { dir('eks-terraform'){ sh 'terraform validate -no-color' } } }
-    stage('Terraform plan')     { steps { dir('eks-terraform'){ sh 'terraform plan -no-color -out=tfplan' } } }
+
+    stage('Terraform validate') {
+      steps { sh 'terraform validate -no-color' }
+    }
+
+    stage('Terraform plan') {
+      steps { sh 'terraform plan -no-color -out=tfplan' }
+    }
+
     stage('Terraform apply') {
       when { expression { return params.APPLY == true } }
-      steps { dir('eks-terraform'){ sh 'terraform apply -no-color -auto-approve tfplan' } }
+      steps { sh 'terraform apply -no-color -auto-approve tfplan' }
     }
   }
+
   post {
     always {
-      archiveArtifacts artifacts: 'eks-terraform/**/terraform.*.log', allowEmptyArchive: true
+      archiveArtifacts artifacts: 'terraform.init.log', allowEmptyArchive: true
     }
   }
 }
