@@ -19,3 +19,4 @@ pkg/
 *.tfvars
 release/wi-kubernetes-manifests.yaml
 *.github
+terraform_main_ec2/jumphost-key.pem
