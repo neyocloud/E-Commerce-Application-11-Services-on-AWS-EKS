@@ -156,7 +156,7 @@ resource "aws_eks_cluster" "eks" {
 
   tags = {
     Name        = "yaswanth-eks-cluster"
-    Environment = "dev"
+    Environment = "local"
     Terraform   = "true"
   }
 

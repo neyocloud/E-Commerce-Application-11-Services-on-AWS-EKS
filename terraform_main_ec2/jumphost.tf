@@ -11,6 +11,6 @@ resource "aws_instance" "ec2" {
   user_data = templatefile("./install-tools.sh", {})
 
   tags = {
-    Name = var.instance_name
+        Name = "Jumphost-Server"
   }
 }
