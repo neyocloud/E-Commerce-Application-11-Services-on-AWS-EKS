@@ -3,8 +3,7 @@ pipeline {
   options {
     durabilityHint('MAX_SURVIVABILITY')
     timestamps()
-    ansiColor('xterm')
-    timeout(time: 60, unit: 'MINUTES') // whole pipeline guard
+    timeout(time: 60, unit: 'MINUTES')
   }
   environment {
     TF_IN_AUTOMATION = '1'
@@ -19,17 +18,11 @@ pipeline {
         ])
       }
     }
-
-    stage('Terraform version') {
-      steps {
-        sh 'terraform --version'
-      }
-    }
-
+    stage('Terraform version') { steps { sh 'terraform --version' } }
     stage('Terraform init') {
       steps {
         dir('eks-terraform') {
-          retry(2) {                      // retry if we resume after restart
+          retry(2) {
             timeout(time: 15, unit: 'MINUTES') {
               sh 'terraform init -input=false -upgrade -no-color --reconfigure'
             }
@@ -37,30 +30,11 @@ pipeline {
         }
       }
     }
-
-    stage('Terraform validate') {
-      steps {
-        dir('eks-terraform') {
-          sh 'terraform validate -no-color'
-        }
-      }
-    }
-
-    stage('Terraform plan') {
-      steps {
-        dir('eks-terraform') {
-          sh 'terraform plan -no-color -out=tfplan'
-        }
-      }
-    }
-
+    stage('Terraform validate') { steps { dir('eks-terraform'){ sh 'terraform validate -no-color' } } }
+    stage('Terraform plan')     { steps { dir('eks-terraform'){ sh 'terraform plan -no-color -out=tfplan' } } }
     stage('Terraform apply') {
       when { expression { return params.APPLY == true } }
-      steps {
-        dir('eks-terraform') {
-          sh 'terraform apply -no-color -auto-approve tfplan'
-        }
-      }
+      steps { dir('eks-terraform'){ sh 'terraform apply -no-color -auto-approve tfplan' } }
     }
   }
   post {
