@@ -1,33 +1,71 @@
 pipeline {
-  agent { label 'built-in' }   // or 'master' if that’s your node’s label
-
-  parameters {
-    choice(name: 'ACTION', choices: ['apply','destroy'], description: 'Select Terraform action')
+  agent any
+  options {
+    durabilityHint('MAX_SURVIVABILITY')
+    timestamps()
+    ansiColor('xterm')
+    timeout(time: 60, unit: 'MINUTES') // whole pipeline guard
   }
-
+  environment {
+    TF_IN_AUTOMATION = '1'
+    TF_INPUT = '0'
+  }
   stages {
     stage('Checkout from Git') {
       steps {
-        // For Pipeline from SCM, Jenkins already fetched the Jenkinsfile.
-        // If you need the whole repo in the workspace, do:
-        checkout scm
+        checkout([$class: 'GitSCM',
+          branches: [[name: '*/main']],
+          userRemoteConfigs: [[url: 'https://github.com/neyocloud/E-Commerce-Application-11-Services-on-AWS-EKS']]
+        ])
       }
     }
 
-    stage('Terraform version') { steps { sh 'terraform --version' } }
-
-    stage('Terraform init')      { steps { dir('eks-terraform') { sh 'terraform init --reconfigure' } } }
-    stage('Terraform validate')  { steps { dir('eks-terraform') { sh 'terraform validate' } } }
-    stage('Terraform plan')      { steps { dir('eks-terraform') { sh 'terraform plan' } } }
-
-    stage('Terraform apply') {
-      when { expression { params.ACTION == 'apply' } }
-      steps { dir('eks-terraform') { sh 'terraform apply -auto-approve' } }
+    stage('Terraform version') {
+      steps {
+        sh 'terraform --version'
+      }
     }
 
-    stage('Terraform destroy') {
-      when { expression { params.ACTION == 'destroy' } }
-      steps { dir('eks-terraform') { sh 'terraform destroy -auto-approve' } }
+    stage('Terraform init') {
+      steps {
+        dir('eks-terraform') {
+          retry(2) {                      // retry if we resume after restart
+            timeout(time: 15, unit: 'MINUTES') {
+              sh 'terraform init -input=false -upgrade -no-color --reconfigure'
+            }
+          }
+        }
+      }
+    }
+
+    stage('Terraform validate') {
+      steps {
+        dir('eks-terraform') {
+          sh 'terraform validate -no-color'
+        }
+      }
+    }
+
+    stage('Terraform plan') {
+      steps {
+        dir('eks-terraform') {
+          sh 'terraform plan -no-color -out=tfplan'
+        }
+      }
+    }
+
+    stage('Terraform apply') {
+      when { expression { return params.APPLY == true } }
+      steps {
+        dir('eks-terraform') {
+          sh 'terraform apply -no-color -auto-approve tfplan'
+        }
+      }
+    }
+  }
+  post {
+    always {
+      archiveArtifacts artifacts: 'eks-terraform/**/terraform.*.log', allowEmptyArchive: true
     }
   }
 }
