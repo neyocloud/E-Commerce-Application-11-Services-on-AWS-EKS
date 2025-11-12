@@ -1,20 +1,13 @@
 pipeline {
   agent any
-
-  options {
-    durabilityHint('MAX_SURVIVABILITY')
-    timestamps()
-    timeout(time: 60, unit: 'MINUTES')
-  }
-
+  options { durabilityHint('MAX_SURVIVABILITY'); timestamps(); timeout(time: 60, unit: 'MINUTES') }
   environment {
     TF_IN_AUTOMATION = '1'
     TF_INPUT         = '0'
     TF_PLUGIN_CACHE_DIR = '/var/lib/jenkins/.terraform.d/plugin-cache'
     TF_LOG      = 'INFO'
     TF_LOG_PATH = "${WORKSPACE}/terraform.init.log"
-    // Set your default region explicitly; Terraform errors if region mismatches:contentReference[oaicite:0]{index=0}
-    AWS_DEFAULT_REGION = "us-east-1"
+    AWS_DEFAULT_REGION = 'us-east-1'
   }
 
   stages {
@@ -27,57 +20,51 @@ pipeline {
       }
     }
 
-    // Preflight checks for network/API reachability
     stage('Preflight: network') {
       steps {
         sh '''
           set -e
           mkdir -p /var/lib/jenkins/.terraform.d/plugin-cache || true
-          echo "Checking registry..."
           curl -I --max-time 10 https://registry.terraform.io >/dev/null 2>&1 || { echo "Cannot reach registry.terraform.io"; exit 1; }
-          echo "Checking releases..."
           curl -I --max-time 10 https://releases.hashicorp.com >/dev/null 2>&1 || { echo "Cannot reach releases.hashicorp.com"; exit 1; }
-          echo "Checking GitHub objects..."
           curl -I --max-time 10 https://objects.githubusercontent.com >/dev/null 2>&1 || { echo "Cannot reach objects.githubusercontent.com"; exit 1; }
         '''
       }
     }
 
-    stage('Terraform version') {
-      steps { sh 'terraform --version' }
-    }
+    stage('Terraform version') { steps { sh 'terraform --version' } }
 
-    // Run init with -upgrade to get the latest provider versions
     stage('Terraform init') {
       steps {
-        retry(2) {
-          timeout(time: 10, unit: 'MINUTES') {
-            sh 'terraform init -input=false -no-color -upgrade --reconfigure'
+        dir('eks-terraform') {
+          retry(2) {
+            timeout(time: 10, unit: 'MINUTES') {
+              sh 'terraform init -input=false -no-color -upgrade --reconfigure'
+            }
           }
         }
       }
     }
 
     stage('Terraform validate') {
-      steps { sh 'terraform validate -no-color' }
+      steps { dir('eks-terraform') { sh 'terraform validate -no-color' } }
     }
 
-    // Pass AWS keys and optional session token into plan; print identity and region
     stage('Terraform plan') {
       steps {
         withCredentials([
           string(credentialsId: 'aws-access-key',   variable: 'AWS_ACCESS_KEY_ID'),
           string(credentialsId: 'aws-secret-key',   variable: 'AWS_SECRET_ACCESS_KEY'),
-          string(credentialsId: 'aws-session-token', variable: 'AWS_SESSION_TOKEN') // optional; remove if not needed
+          // comment out if not using temp creds:
+          string(credentialsId: 'aws-session-token', variable: 'AWS_SESSION_TOKEN')
         ]) {
-          sh '''
-            echo "Using AWS region: $AWS_DEFAULT_REGION"
-            echo "Caller identity check:"
-            aws sts get-caller-identity || true
-
-            # Enable detailed logging for debugging:contentReference[oaicite:1]{index=1}
-            TF_LOG=DEBUG terraform plan -no-color -out=tfplan 2> plan.debug.log
-          '''
+          dir('eks-terraform') {
+            sh '''
+              echo "Region: $AWS_DEFAULT_REGION"
+              aws sts get-caller-identity || true
+              TF_LOG=INFO terraform plan -no-color -out=tfplan 2> plan.debug.log
+            '''
+          }
         }
       }
     }
@@ -88,18 +75,17 @@ pipeline {
         withCredentials([
           string(credentialsId: 'aws-access-key',   variable: 'AWS_ACCESS_KEY_ID'),
           string(credentialsId: 'aws-secret-key',   variable: 'AWS_SECRET_ACCESS_KEY'),
-          string(credentialsId: 'aws-session-token', variable: 'AWS_SESSION_TOKEN') // optional
+          string(credentialsId: 'aws-session-token', variable: 'AWS_SESSION_TOKEN')
         ]) {
-          sh 'terraform apply -no-color -auto-approve tfplan'
+          dir('eks-terraform') {
+            sh 'terraform apply -no-color -auto-approve tfplan'
+          }
         }
       }
     }
   }
 
   post {
-    always {
-      // Archive both init and plan debug logs for troubleshooting
-      archiveArtifacts artifacts: 'terraform.init.log, plan.debug.log', allowEmptyArchive: true
-    }
+    always { archiveArtifacts artifacts: 'terraform.init.log, eks-terraform/plan.debug.log', allowEmptyArchive: true }
   }
 }
