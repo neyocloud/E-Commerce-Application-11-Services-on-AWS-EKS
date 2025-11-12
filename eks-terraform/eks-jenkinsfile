@@ -1,16 +1,31 @@
 pipeline {
   agent any
-  options { durabilityHint('MAX_SURVIVABILITY'); timestamps(); timeout(time: 60, unit: 'MINUTES') }
+
+  options {
+    durabilityHint('MAX_SURVIVABILITY')
+    timestamps()
+    timeout(time: 60, unit: 'MINUTES')   // whole-pipeline guard
+  }
+
   environment {
-    TF_IN_AUTOMATION = '1'
-    TF_INPUT         = '0'
+    // Terraform non-interactive + provider cache
+    TF_IN_AUTOMATION   = '1'
+    TF_INPUT           = '0'
     TF_PLUGIN_CACHE_DIR = '/var/lib/jenkins/.terraform.d/plugin-cache'
-    TF_LOG      = 'INFO'
-    TF_LOG_PATH = "${WORKSPACE}/terraform.init.log"
+    TF_LOG            = 'INFO'
+    TF_LOG_PATH       = "${WORKSPACE}/terraform.init.log"
+
+    // Set your AWS region explicitly
     AWS_DEFAULT_REGION = 'us-east-1'
+
+    // --- If you are behind a proxy, UNCOMMENT and set these ---
+    // HTTPS_PROXY = 'http://proxy.internal:3128'
+    // HTTP_PROXY  = 'http://proxy.internal:3128'
+    // NO_PROXY    = '169.254.169.254,localhost,127.0.0.1,.amazonaws.com'
   }
 
   stages {
+
     stage('Checkout from Git') {
       steps {
         checkout([$class: 'GitSCM',
@@ -20,20 +35,46 @@ pipeline {
       }
     }
 
+    // ---------- DIAGNOSTICS: fail-fast and show why ----------
     stage('Preflight: network') {
+      options { timeout(time: 2, unit: 'MINUTES') }  // cap this stage
       steps {
         sh '''
-          set -e
+          set -euxo pipefail
           mkdir -p /var/lib/jenkins/.terraform.d/plugin-cache || true
-          curl -I --max-time 10 https://registry.terraform.io >/dev/null 2>&1 || { echo "Cannot reach registry.terraform.io"; exit 1; }
-          curl -I --max-time 10 https://releases.hashicorp.com >/dev/null 2>&1 || { echo "Cannot reach releases.hashicorp.com"; exit 1; }
-          curl -I --max-time 10 https://objects.githubusercontent.com >/dev/null 2>&1 || { echo "Cannot reach objects.githubusercontent.com"; exit 1; }
+
+          echo "=== Network snapshot ==="
+          uname -a || true
+          date
+          ip route || true
+          cat /etc/resolv.conf || true
+          getent hosts registry.terraform.io || true
+          getent hosts releases.hashicorp.com || true
+          getent hosts objects.githubusercontent.com || true
+
+          echo "=== Testing endpoints (DNS+TLS) ==="
+          for url in \
+            https://registry.terraform.io \
+            https://releases.hashicorp.com \
+            https://objects.githubusercontent.com
+          do
+            echo "--- $url ---"
+            curl -sS -v --connect-timeout 3 --max-time 8 -I "$url" >/dev/null || echo "FAIL: $url"
+          done
+
+          echo "=== AWS identity (non-fatal if no creds here) ==="
+          aws sts get-caller-identity || true
+
+          echo "=== Preflight complete ==="
         '''
       }
     }
 
-    stage('Terraform version') { steps { sh 'terraform --version' } }
+    stage('Terraform version') {
+      steps { sh 'terraform --version' }
+    }
 
+    // ---------- TERRAFORM IN eks-terraform/ FOLDER ----------
     stage('Terraform init') {
       steps {
         dir('eks-terraform') {
@@ -47,16 +88,24 @@ pipeline {
     }
 
     stage('Terraform validate') {
-      steps { dir('eks-terraform') { sh 'terraform validate -no-color' } }
+      steps {
+        dir('eks-terraform') {
+          sh 'terraform validate -no-color'
+        }
+      }
     }
 
     stage('Terraform plan') {
       steps {
+        // Create these Jenkins credentials (Secret text):
+        //   aws-access-key  (Access Key ID)
+        //   aws-secret-key  (Secret Access Key)
+        // Optional if using temp creds:
+        //   aws-session-token (Session Token)
         withCredentials([
           string(credentialsId: 'aws-access-key',   variable: 'AWS_ACCESS_KEY_ID'),
           string(credentialsId: 'aws-secret-key',   variable: 'AWS_SECRET_ACCESS_KEY'),
-          
-        ]) {
+        
           dir('eks-terraform') {
             sh '''
               echo "Region: $AWS_DEFAULT_REGION"
@@ -85,6 +134,8 @@ pipeline {
   }
 
   post {
-    always { archiveArtifacts artifacts: 'terraform.init.log, eks-terraform/plan.debug.log', allowEmptyArchive: true }
+    always {
+      archiveArtifacts artifacts: 'terraform.init.log, eks-terraform/plan.debug.log', allowEmptyArchive: true
+    }
   }
 }
