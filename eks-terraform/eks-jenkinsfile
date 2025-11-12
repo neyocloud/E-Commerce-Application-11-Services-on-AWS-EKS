@@ -7,8 +7,8 @@ pipeline {
 
   options {
     timestamps()
-    durabilityHint('MAX_SURVIVABILITY')                 // better resume after restarts
-    timeout(time: 90, unit: 'MINUTES')                  // global cap
+    durabilityHint('MAX_SURVIVABILITY')                 // Survives Jenkins restarts
+    timeout(time: 90, unit: 'MINUTES')                  // Global build timeout
     buildDiscarder(logRotator(daysToKeepStr: '7', numToKeepStr: '10'))
   }
 
@@ -21,7 +21,6 @@ pipeline {
   stages {
     stage('Checkout from Git') {
       steps {
-        // use the job's SCM config
         checkout scm
       }
     }
@@ -89,7 +88,6 @@ pipeline {
 
     stage('Terraform plan') {
       steps {
-        // Jenkins credential of type "AWS Credentials" with ID: aws-access-key
         withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-access-key']]) {
           dir('eks-terraform') {
             retry(2) {
