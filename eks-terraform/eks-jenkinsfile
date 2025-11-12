@@ -2,68 +2,58 @@ pipeline {
   agent any
 
   options {
-    durabilityHint('MAX_SURVIVABILITY')
     timestamps()
-    timeout(time: 60, unit: 'MINUTES')
-    buildDiscarder(logRotator(daysToKeepStr: '7', numToKeepStr: '10')) // keep 10 builds / 7 days
+    ansiColor('xterm')
+    durabilityHint('MAX_SURVIVABILITY')           // survive controller restarts
+    timeout(time: 90, unit: 'MINUTES')            // global cap
+    buildDiscarder(logRotator(daysToKeepStr: '7', numToKeepStr: '10'))
+  }
+
+  parameters {
+    booleanParam(name: 'AUTO_APPLY', defaultValue: false, description: 'If true, auto-apply without manual approval')
   }
 
   environment {
     TF_IN_AUTOMATION     = '1'
-    TF_INPUT             = '0'
     TF_PLUGIN_CACHE_DIR  = '/var/lib/jenkins/.terraform.d/plugin-cache'
-    TF_LOG               = 'INFO'
-    TF_LOG_PATH          = "${WORKSPACE}/terraform.init.log"
-    AWS_DEFAULT_REGION   = 'us-east-1'
-    // HTTPS_PROXY = 'http://proxy.internal:3128'
-    // HTTP_PROXY  = 'http://proxy.internal:3128'
-    // NO_PROXY    = '169.254.169.254,localhost,127.0.0.1,.amazonaws.com'
+    AWS_REGION           = 'us-east-1'            // change if needed
+    // Jenkins JVM tmp was moved to /var/lib/jenkins/tmp already
   }
 
   stages {
+
     stage('Checkout from Git') {
       steps {
-        checkout([$class: 'GitSCM',
-          branches: [[name: '*/main']],
-          userRemoteConfigs: [[url: 'https://github.com/neyocloud/E-Commerce-Application-11-Services-on-AWS-EKS']]
-        ])
+        checkout scm
       }
     }
 
     stage('Preflight: network') {
-      options { timeout(time: 2, unit: 'MINUTES') }
       steps {
-        sh '''
-          set -euxo pipefail
-          mkdir -p /var/lib/jenkins/.terraform.d/plugin-cache || true
+        timeout(time: 2, unit: 'MINUTES') {
+          sh '''
+            set -euxo pipefail
+            mkdir -p "$TF_PLUGIN_CACHE_DIR"
+            echo '=== Network snapshot ==='
+            uname -a; date; ip route; cat /etc/resolv.conf
 
-          echo "=== Network snapshot ==="
-          uname -a || true
-          date
-          ip route || true
-          cat /etc/resolv.conf || true
-          getent hosts registry.terraform.io || true
-          getent hosts releases.hashicorp.com || true
-          getent hosts objects.githubusercontent.com || true
+            echo '=== Testing endpoints (DNS+TLS) ==='
+            for url in https://registry.terraform.io https://releases.hashicorp.com https://objects.githubusercontent.com; do
+              echo "--- $url ---"
+              curl -sS -v --connect-timeout 3 --max-time 8 -I "$url" >/dev/null
+            done
 
-          echo "=== Testing endpoints (DNS+TLS) ==="
-          for url in \
-            https://registry.terraform.io \
-            https://releases.hashicorp.com \
-            https://objects.githubusercontent.com
-          do
-            echo "--- $url ---"
-            curl -sS -v --connect-timeout 3 --max-time 8 -I "$url" >/dev/null || echo "FAIL: $url"
-          done
-
-          echo "=== AWS identity (non-fatal) ==="
-          aws sts get-caller-identity || true
-        '''
+            echo '=== AWS identity (non-fatal) ==='
+            aws sts get-caller-identity || true
+          '''
+        }
       }
     }
 
     stage('Terraform version') {
-      steps { sh 'terraform --version' }
+      steps {
+        sh 'terraform --version'
+      }
     }
 
     stage('Terraform init') {
@@ -71,7 +61,6 @@ pipeline {
         dir('eks-terraform') {
           retry(2) {
             timeout(time: 20, unit: 'MINUTES') {
-              // Stable: no -upgrade unless you intend to upgrade providers
               sh 'terraform init -input=false -no-color --reconfigure'
             }
           }
@@ -80,48 +69,51 @@ pipeline {
     }
 
     stage('Terraform validate') {
-      options { timeout(time: 3, unit: 'MINUTES') }
       steps {
         dir('eks-terraform') {
-          sh '''
-            set -euxo pipefail
-            pwd; ls -la
-            time terraform validate -no-color -json | tee ../tf-validate.json
-          '''
+          retry(2) {
+            timeout(time: 10, unit: 'MINUTES') {
+              sh '''
+                set -euxo pipefail
+                pwd; ls -la
+                terraform validate -no-color -json | tee ../tf-validate.json
+              '''
+            }
+          }
         }
       }
     }
 
     stage('Terraform plan') {
       steps {
-        withCredentials([
-          string(credentialsId: 'aws-access-key',  variable: 'AWS_ACCESS_KEY_ID'),
-          string(credentialsId: 'aws-secret-key',  variable: 'AWS_SECRET_ACCESS_KEY')
-          // If you use temporary creds, UNCOMMENT the next line:
-          // , string(credentialsId: 'aws-session-token', variable: 'AWS_SESSION_TOKEN')
-        ]) {
+        withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-secret']]) {
           dir('eks-terraform') {
-            sh '''
-              echo "Region: $AWS_DEFAULT_REGION"
-              aws sts get-caller-identity || true
-              TF_LOG=INFO terraform plan -no-color -out=tfplan 2> plan.debug.log
-            '''
+            retry(2) {
+              timeout(time: 20, unit: 'MINUTES') {
+                sh '''
+                  set -euxo pipefail
+                  aws sts get-caller-identity
+                  terraform plan -no-color -out=tfplan.bin | tee ../tf-plan.txt
+                '''
+              }
+            }
           }
         }
       }
     }
 
     stage('Terraform apply') {
-      when { expression { return params.APPLY == true } }
+      when { expression { return params.AUTO_APPLY } }
       steps {
-        withCredentials([
-          string(credentialsId: 'aws-access-key',  variable: 'AWS_ACCESS_KEY_ID'),
-          string(credentialsId: 'aws-secret-key',  variable: 'AWS_SECRET_ACCESS_KEY')
-          // If using temporary creds, uncomment:
-          // , string(credentialsId: 'aws-session-token', variable: 'AWS_SESSION_TOKEN')
-        ]) {
+        input message: 'Apply the plan to AWS?', ok: 'Yes, apply'
+        withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-secret']]) {
           dir('eks-terraform') {
-            sh 'terraform apply -no-color -auto-approve tfplan'
+            timeout(time: 30, unit: 'MINUTES') {
+              sh '''
+                set -euxo pipefail
+                terraform apply -no-color -auto-approve tfplan.bin | tee ../tf-apply.txt
+              '''
+            }
           }
         }
       }
@@ -130,8 +122,8 @@ pipeline {
 
   post {
     always {
-      archiveArtifacts artifacts: 'terraform.init.log, tf-validate.json, eks-terraform/plan.debug.log', allowEmptyArchive: true
-      cleanWs(deleteDirs: true)
+      archiveArtifacts artifacts: 'tf-*.txt, **/terraform.tfstate*', fingerprint: true, allowEmptyArchive: true
+      cleanWs()
     }
   }
 }
