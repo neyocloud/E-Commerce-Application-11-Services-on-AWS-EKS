@@ -5,17 +5,18 @@ pipeline {
     durabilityHint('MAX_SURVIVABILITY')
     timestamps()
     timeout(time: 60, unit: 'MINUTES')
+    buildDiscarder(logRotator(numDaysToKeepStr: '7', numToKeepStr: '10')) // keep 10 builds / 7 days
   }
 
   environment {
-    TF_IN_AUTOMATION    = '1'
-    TF_INPUT            = '0'
-    TF_PLUGIN_CACHE_DIR = '/var/lib/jenkins/.terraform.d/plugin-cache'
-    TF_LOG              = 'INFO'
-    TF_LOG_PATH         = "${WORKSPACE}/terraform.init.log"
-    AWS_DEFAULT_REGION  = 'us-east-1'
+    TF_IN_AUTOMATION     = '1'
+    TF_INPUT             = '0'
+    TF_PLUGIN_CACHE_DIR  = '/var/lib/jenkins/.terraform.d/plugin-cache'
+    TF_LOG               = 'INFO'
+    TF_LOG_PATH          = "${WORKSPACE}/terraform.init.log"
+    AWS_DEFAULT_REGION   = 'us-east-1'
 
-    // If you are behind a proxy, uncomment and set:
+    // Uncomment and set these if you're behind a proxy:
     // HTTPS_PROXY = 'http://proxy.internal:3128'
     // HTTP_PROXY  = 'http://proxy.internal:3128'
     // NO_PROXY    = '169.254.169.254,localhost,127.0.0.1,.amazonaws.com'
@@ -32,6 +33,7 @@ pipeline {
       }
     }
 
+    // ----------- Preflight Diagnostics -----------
     stage('Preflight: network') {
       options { timeout(time: 2, unit: 'MINUTES') }
       steps {
@@ -64,6 +66,7 @@ pipeline {
       }
     }
 
+    // ----------- Terraform Section -----------
     stage('Terraform version') {
       steps { sh 'terraform --version' }
     }
@@ -72,8 +75,9 @@ pipeline {
       steps {
         dir('eks-terraform') {
           retry(2) {
-            timeout(time: 10, unit: 'MINUTES') {
-              sh 'terraform init -input=false -no-color -upgrade --reconfigure'
+            timeout(time: 20, unit: 'MINUTES') {
+              // More stable, skip -upgrade unless intentionally upgrading providers
+              sh 'terraform init -input=false -no-color --reconfigure'
             }
           }
         }
@@ -81,9 +85,14 @@ pipeline {
     }
 
     stage('Terraform validate') {
+      options { timeout(time: 3, unit: 'MINUTES') }
       steps {
         dir('eks-terraform') {
-          sh 'terraform validate -no-color'
+          sh '''
+            set -euxo pipefail
+            pwd; ls -la
+            time terraform validate -no-color -json | tee ../tf-validate.json
+          '''
         }
       }
     }
@@ -93,7 +102,7 @@ pipeline {
         withCredentials([
           string(credentialsId: 'aws-access-key',  variable: 'AWS_ACCESS_KEY_ID'),
           string(credentialsId: 'aws-secret-key',  variable: 'AWS_SECRET_ACCESS_KEY')
-          // If you use temporary creds, UNCOMMENT the next line (and ensure the ID exists):
+          // If you use temporary credentials, UNCOMMENT the next line:
           // , string(credentialsId: 'aws-session-token', variable: 'AWS_SESSION_TOKEN')
         ]) {
           dir('eks-terraform') {
@@ -113,7 +122,7 @@ pipeline {
         withCredentials([
           string(credentialsId: 'aws-access-key',  variable: 'AWS_ACCESS_KEY_ID'),
           string(credentialsId: 'aws-secret-key',  variable: 'AWS_SECRET_ACCESS_KEY')
-          // If you use temporary creds, UNCOMMENT the next line:
+          // If using temporary creds, uncomment the next line:
           // , string(credentialsId: 'aws-session-token', variable: 'AWS_SESSION_TOKEN')
         ]) {
           dir('eks-terraform') {
@@ -126,7 +135,9 @@ pipeline {
 
   post {
     always {
-      archiveArtifacts artifacts: 'terraform.init.log, eks-terraform/plan.debug.log', allowEmptyArchive: true
+      // Archive logs & clean workspace
+      archiveArtifacts artifacts: 'terraform.init.log, tf-validate.json, eks-terraform/plan.debug.log', allowEmptyArchive: true
+      cleanWs(deleteDirs: true)
     }
   }
 }
