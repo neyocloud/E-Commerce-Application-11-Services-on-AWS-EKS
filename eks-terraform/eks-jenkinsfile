@@ -4,21 +4,18 @@ pipeline {
   options {
     durabilityHint('MAX_SURVIVABILITY')
     timestamps()
-    timeout(time: 60, unit: 'MINUTES')   // whole-pipeline guard
+    timeout(time: 60, unit: 'MINUTES')
   }
 
   environment {
-    // Terraform non-interactive + provider cache
-    TF_IN_AUTOMATION   = '1'
-    TF_INPUT           = '0'
+    TF_IN_AUTOMATION    = '1'
+    TF_INPUT            = '0'
     TF_PLUGIN_CACHE_DIR = '/var/lib/jenkins/.terraform.d/plugin-cache'
-    TF_LOG            = 'INFO'
-    TF_LOG_PATH       = "${WORKSPACE}/terraform.init.log"
+    TF_LOG              = 'INFO'
+    TF_LOG_PATH         = "${WORKSPACE}/terraform.init.log"
+    AWS_DEFAULT_REGION  = 'us-east-1'
 
-    // Set your AWS region explicitly
-    AWS_DEFAULT_REGION = 'us-east-1'
-
-    // --- If you are behind a proxy, UNCOMMENT and set these ---
+    // If you are behind a proxy, uncomment and set:
     // HTTPS_PROXY = 'http://proxy.internal:3128'
     // HTTP_PROXY  = 'http://proxy.internal:3128'
     // NO_PROXY    = '169.254.169.254,localhost,127.0.0.1,.amazonaws.com'
@@ -35,9 +32,8 @@ pipeline {
       }
     }
 
-    // ---------- DIAGNOSTICS: fail-fast and show why ----------
     stage('Preflight: network') {
-      options { timeout(time: 2, unit: 'MINUTES') }  // cap this stage
+      options { timeout(time: 2, unit: 'MINUTES') }
       steps {
         sh '''
           set -euxo pipefail
@@ -62,10 +58,8 @@ pipeline {
             curl -sS -v --connect-timeout 3 --max-time 8 -I "$url" >/dev/null || echo "FAIL: $url"
           done
 
-          echo "=== AWS identity (non-fatal if no creds here) ==="
+          echo "=== AWS identity (non-fatal) ==="
           aws sts get-caller-identity || true
-
-          echo "=== Preflight complete ==="
         '''
       }
     }
@@ -74,7 +68,6 @@ pipeline {
       steps { sh 'terraform --version' }
     }
 
-    // ---------- TERRAFORM IN eks-terraform/ FOLDER ----------
     stage('Terraform init') {
       steps {
         dir('eks-terraform') {
@@ -96,46 +89,4 @@ pipeline {
     }
 
     stage('Terraform plan') {
-      steps {
-        // Create these Jenkins credentials (Secret text):
-        //   aws-access-key  (Access Key ID)
-        //   aws-secret-key  (Secret Access Key)
-        // Optional if using temp creds:
-        //   aws-session-token (Session Token)
-        withCredentials([
-          string(credentialsId: 'aws-access-key',   variable: 'AWS_ACCESS_KEY_ID'),
-          string(credentialsId: 'aws-secret-key',   variable: 'AWS_SECRET_ACCESS_KEY'),
-        
-          dir('eks-terraform') {
-            sh '''
-              echo "Region: $AWS_DEFAULT_REGION"
-              aws sts get-caller-identity || true
-              TF_LOG=INFO terraform plan -no-color -out=tfplan 2> plan.debug.log
-            '''
-          }
-        }
-      }
-    }
-
-    stage('Terraform apply') {
-      when { expression { return params.APPLY == true } }
-      steps {
-        withCredentials([
-          string(credentialsId: 'aws-access-key',   variable: 'AWS_ACCESS_KEY_ID'),
-          string(credentialsId: 'aws-secret-key',   variable: 'AWS_SECRET_ACCESS_KEY'),
-          string(credentialsId: 'aws-session-token', variable: 'AWS_SESSION_TOKEN')
-        ]) {
-          dir('eks-terraform') {
-            sh 'terraform apply -no-color -auto-approve tfplan'
-          }
-        }
-      }
-    }
-  }
-
-  post {
-    always {
-      archiveArtifacts artifacts: 'terraform.init.log, eks-terraform/plan.debug.log', allowEmptyArchive: true
-    }
-  }
-}
+      ste
