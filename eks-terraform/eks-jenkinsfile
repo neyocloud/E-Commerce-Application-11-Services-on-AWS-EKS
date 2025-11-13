@@ -3,7 +3,7 @@ pipeline {
 
   options {
     timestamps()
-    timeout(time: 30, unit: 'MINUTES')   // prevent endless hangs
+    timeout(time: 30, unit: 'MINUTES')
   }
 
   parameters {
@@ -23,7 +23,6 @@ pipeline {
 
     stage('Checkout from Git') {
       steps {
-        // Pipeline-from-SCM usually checks out automatically, but this is safe/explicit
         checkout scm
         echo 'Git repository checked out.'
       }
@@ -77,7 +76,6 @@ pipeline {
               set -euxo pipefail
               terraform plan -input=false -no-color -out=tfplan
             '''
-            // keep the plan for troubleshooting if needed
             sh 'terraform show -no-color tfplan > tfplan.txt || true'
             archiveArtifacts artifacts: 'eks-terraform/tfplan.txt', onlyIfSuccessful: false, allowEmptyArchive: true
           }
@@ -122,7 +120,8 @@ pipeline {
 
   post {
     always {
-      echo "Build finished at $(date)"
+      // FIX: run the $(date) in a shell step so Groovy doesn’t parse it
+      sh 'echo "Build finished at $(date)"'
       cleanWs(deleteDirs: true)
     }
   }
