@@ -1,49 +1,31 @@
 pipeline {
   agent any
 
-  parameters {
-    booleanParam(name: 'AUTO_APPLY', defaultValue: false, description: 'If true, auto-apply without manual approval')
-  }
-
   options {
     timestamps()
-    durabilityHint('MAX_SURVIVABILITY')                 // Survives Jenkins restarts
-    timeout(time: 90, unit: 'MINUTES')                  // Global build timeout
-    buildDiscarder(logRotator(daysToKeepStr: '7', numToKeepStr: '10'))
+    timeout(time: 30, unit: 'MINUTES')   // prevent endless hangs
+  }
+
+  parameters {
+    choice(
+      name: 'ACTION',
+      choices: ['apply', 'destroy'],
+      description: 'Select the Terraform action to perform'
+    )
   }
 
   environment {
-    TF_IN_AUTOMATION     = '1'
-    TF_PLUGIN_CACHE_DIR  = '/var/lib/jenkins/.terraform.d/plugin-cache'
-    AWS_REGION           = 'us-east-1'
+    AWS_REGION          = 'us-east-1'     // change if needed
+    TF_PLUGIN_CACHE_DIR = '/var/lib/jenkins/.terraform.d/plugin-cache'
   }
 
   stages {
+
     stage('Checkout from Git') {
       steps {
+        // Pipeline-from-SCM usually checks out automatically, but this is safe/explicit
         checkout scm
-      }
-    }
-
-    stage('Preflight: network') {
-      steps {
-        timeout(time: 2, unit: 'MINUTES') {
-          sh '''
-            set -euxo pipefail
-            mkdir -p "$TF_PLUGIN_CACHE_DIR"
-            echo '=== Network snapshot ==='
-            uname -a; date; ip route; cat /etc/resolv.conf || true
-
-            echo '=== Testing endpoints (DNS+TLS) ==='
-            for url in https://registry.terraform.io https://releases.hashicorp.com https://objects.githubusercontent.com; do
-              echo "--- $url ---"
-              curl -sS -I --connect-timeout 3 --max-time 8 "$url" >/dev/null
-            done
-
-            echo '=== AWS identity (non-fatal) ==='
-            aws sts get-caller-identity || true
-          '''
-        }
+        echo 'Git repository checked out.'
       }
     }
 
@@ -55,11 +37,19 @@ pipeline {
 
     stage('Terraform init') {
       steps {
-        dir('eks-terraform') {
-          retry(2) {
-            timeout(time: 20, unit: 'MINUTES') {
-              sh 'terraform init -input=false -no-color --reconfigure'
-            }
+        withCredentials([
+          usernamePassword(
+            credentialsId: 'aws-access-key',
+            usernameVariable: 'AWS_ACCESS_KEY_ID',
+            passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+          )
+        ]) {
+          dir('eks-terraform') {
+            sh '''
+              set -euxo pipefail
+              mkdir -p "${TF_PLUGIN_CACHE_DIR}"
+              terraform init -input=false --reconfigure
+            '''
           }
         }
       }
@@ -68,65 +58,63 @@ pipeline {
     stage('Terraform validate') {
       steps {
         dir('eks-terraform') {
-          retry(2) {
-            timeout(time: 10, unit: 'MINUTES') {
-              sh '''
-                set -euxo pipefail
-                pwd; ls -la
-                terraform validate -no-color -json | tee ../tf-validate.json
-              '''
-            }
-          }
-        }
-      }
-      post {
-        always {
-          archiveArtifacts artifacts: 'tf-validate.json', allowEmptyArchive: true
+          sh 'terraform validate'
         }
       }
     }
 
     stage('Terraform plan') {
       steps {
-        withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-access-key']]) {
+        withCredentials([
+          usernamePassword(
+            credentialsId: 'aws-access-key',
+            usernameVariable: 'AWS_ACCESS_KEY_ID',
+            passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+          )
+        ]) {
           dir('eks-terraform') {
-            retry(2) {
-              timeout(time: 20, unit: 'MINUTES') {
-                sh '''
-                  set -euxo pipefail
-                  aws sts get-caller-identity
-                  terraform plan -no-color -out=tfplan.bin | tee ../tf-plan.txt
-                '''
-              }
-            }
+            sh '''
+              set -euxo pipefail
+              terraform plan -input=false -no-color -out=tfplan
+            '''
+            // keep the plan for troubleshooting if needed
+            sh 'terraform show -no-color tfplan > tfplan.txt || true'
+            archiveArtifacts artifacts: 'eks-terraform/tfplan.txt', onlyIfSuccessful: false, allowEmptyArchive: true
           }
-        }
-      }
-      post {
-        always {
-          archiveArtifacts artifacts: 'eks-terraform/tfplan.bin, tf-plan.txt', allowEmptyArchive: true
         }
       }
     }
 
     stage('Terraform apply') {
-      when { expression { return params.AUTO_APPLY } }
+      when { expression { params.ACTION == 'apply' } }
       steps {
-        input message: 'Apply the plan to AWS?', ok: 'Yes, apply'
-        withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-access-key']]) {
+        withCredentials([
+          usernamePassword(
+            credentialsId: 'aws-access-key',
+            usernameVariable: 'AWS_ACCESS_KEY_ID',
+            passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+          )
+        ]) {
           dir('eks-terraform') {
-            timeout(time: 30, unit: 'MINUTES') {
-              sh '''
-                set -euxo pipefail
-                terraform apply -no-color -auto-approve tfplan.bin | tee ../tf-apply.txt
-              '''
-            }
+            sh 'terraform apply -input=false -auto-approve'
           }
         }
       }
-      post {
-        always {
-          archiveArtifacts artifacts: 'tf-apply.txt', allowEmptyArchive: true
+    }
+
+    stage('Terraform destroy') {
+      when { expression { params.ACTION == 'destroy' } }
+      steps {
+        withCredentials([
+          usernamePassword(
+            credentialsId: 'aws-access-key',
+            usernameVariable: 'AWS_ACCESS_KEY_ID',
+            passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+          )
+        ]) {
+          dir('eks-terraform') {
+            sh 'terraform destroy -input=false -auto-approve'
+          }
         }
       }
     }
@@ -134,7 +122,7 @@ pipeline {
 
   post {
     always {
-      sh 'echo Build finished at $(date)'
+      echo "Build finished at $(date)"
       cleanWs(deleteDirs: true)
     }
   }
